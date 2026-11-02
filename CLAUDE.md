@@ -104,6 +104,12 @@ zmqquic/
 
 **Cite RFCs in the thesis** using `\cite{rfc9000}` etc. Add them to `references.bib`.
 
+### 2.5 go-zeromq
+
+- **Repo**: `https://github.com/zeromq/gomq` or locally at `../gomq`
+- **Purpose**: To have an idea and inspration on how to implement the
+  different ZMTP mechanism.
+
 ---
 
 ## 3. ZMTP Wire Format (what you must implement)
@@ -379,6 +385,7 @@ go doc github.com/quic-go/quic-go.Connection
 6. **No CGo** — pure Go only.
 7. **Minimum Go version**: 1.21 (needed for `log/slog` and `quic-go` ≥ 0.42).
 8. **Module path**: `github.com/<your-username>/zmqquic`
+9. Subdirectory Instruction Files: `benchmarks/CLAUDE.md` — benchmark methodology, tooling, result format
 
 ---
 

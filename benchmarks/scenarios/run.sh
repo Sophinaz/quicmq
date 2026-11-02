@@ -38,10 +38,6 @@ die()     { printf "${RED}[ERR]${RESET} %s\n" "$*" >&2; exit 1; }
 
 require() { command -v "$1" >/dev/null 2>&1 || die "Required tool not found: $1"; }
 
-require docker
-require jq
-docker compose version >/dev/null 2>&1 || die "docker compose v2 required (not docker-compose v1)"
-
 # ── Core runner ───────────────────────────────────────────────────────────────
 #
 # run_scenario NAME SERVICES SCALE_FLAGS [ENV_OVERRIDES]
@@ -53,6 +49,8 @@ docker compose version >/dev/null 2>&1 || die "docker compose v2 required (not d
 # All SCENARIO_* variables exported before calling this function are passed
 # through to the containers as environment variables.
 run_scenario() {
+    require docker; require jq
+    docker compose version >/dev/null 2>&1 || die "docker compose v2 required (not docker-compose v1)"
     local name="$1"; shift
     local services="$1"; shift          # e.g. "pub sub"
     local scale_flags="${1:-}"; shift || true
@@ -403,9 +401,541 @@ ALL_SCENARIOS=(
     datagram_latency
 )
 
+# ── Help ─────────────────────────────────────────────────────────────────────
+
+print_help() {
+    cat <<'EOF'
+
+QuicMQ scenario test runner
+============================
+
+USAGE
+  ./run.sh [dev|prod|phys] [command] [scenario…]
+  ./run.sh --help | -h
+
+MODES
+  dev   (default) Docker-based scenarios.  Requires docker compose v2 + jq.
+                  Network degradation is applied via tc-netem inside containers.
+
+  prod  Mininet-based multi-node scenarios.  Requires mininet (Python) + sudo.
+        Simulates two separate machines connected over a configurable link.
+
+  phys  Physical distributed mode.  Runs across two real machines (laptop + Pi).
+        Requires SSH key auth to the remote host and Go on both machines.
+        The laptop records all results; binaries are cross-compiled and deployed
+        automatically.
+
+DEV COMMANDS
+  all                Run every dev scenario sequentially (builds image first).
+  build              (Re)build the quicmq-scenarios Docker image only.
+  list               Print the list of available dev scenario names.
+  <name> [<name>…]   Run one or more specific scenarios by name.
+
+PROD COMMANDS
+  all                Run every prod scenario sequentially.
+  list               Print the list of available prod scenario names.
+  <name> [<name>…]   Run one or more specific prod scenarios by name.
+
+PHYS COMMANDS
+  all                Run every phys scenario sequentially.
+  list               Print the list of available phys scenario names.
+  <name> [<name>…]   Run one or more specific phys scenarios by name.
+
+PHYS REQUIRED ENV VARS
+  REMOTE_HOST   IP or hostname of the remote machine (required)
+  REMOTE_USER   SSH username on the remote (default: pi)
+
+PHYS OPTIONAL ENV VARS
+  REMOTE_DIR    working directory on remote (default: /tmp/quicmq-bench)
+  REMOTE_ARCH   Go GOARCH for cross-compile (default: amd64)
+  LOCAL_IP      local IP reachable from remote (auto-detected)
+  LOCAL_PUBS    publishers on laptop (default: 2)
+  LOCAL_SUBS    subscribers on laptop (default: 5)
+  REMOTE_PUBS   publishers on remote (default: 2)
+  REMOTE_SUBS   subscribers on remote (default: 5)
+  TRANSPORT     quic (default) or tcp — selects transport for all sockets
+
+EXAMPLES
+  # Dev — baseline pub/sub (Docker)
+  ./run.sh dev pubsub_baseline
+
+  # Dev — all scenarios
+  ./run.sh dev all
+
+  # Prod — mininet baseline (requires sudo)
+  ./run.sh prod prod_pubsub_baseline
+
+  # Phys — baseline across laptop + Pi
+  REMOTE_HOST=192.168.1.42 REMOTE_USER=pi ./run.sh phys phys_pubsub_baseline
+
+  # Phys — full multinode thesis scenario
+  REMOTE_HOST=192.168.1.42 LOCAL_PUBS=10 LOCAL_SUBS=30 REMOTE_PUBS=10 REMOTE_SUBS=30 \
+    ./run.sh phys phys_pubsub_multinode
+
+  # Phys — all scenarios (QUIC + TCP comparison)
+  REMOTE_HOST=192.168.1.42 ./run.sh phys all
+
+  # Phys — TCP transport only (for direct comparison with QUIC results above)
+  REMOTE_HOST=192.168.1.42 TRANSPORT=tcp ./run.sh phys phys_tcp_pubsub_baseline
+
+  # Backward-compatible (defaults to dev all)
+  ./run.sh
+
+RESULTS
+  dev  → benchmarks/scenarios/results/<scenario>/
+  prod → benchmarks/scenarios/prod/results/<scenario>/
+  phys → benchmarks/scenarios/phys/results/<scenario>/
+
+  Each result directory contains one .jsonl file per service role.
+
+METRICS REPORTED
+  pub/dpub  msgs_sent, actual_rate (msg/s), throughput_mbs (MB/s)
+  sub/dsub  msgs_received, seq_gaps (dropped), latency_p50_ms, latency_p99_ms
+  req       reqs_sent, rtt_p50_ms, rtt_p99_ms, errors
+  rep       reqs_handled, actual_rate (req/s)
+
+COMPILE THESIS
+  After collecting results, regenerate plots and compile the PDF:
+    ./compile_thesis.sh
+
+SEE ALSO
+  benchmarks/scenarios/USAGE.md — extended documentation
+  benchmarks/scenarios/phys/phys_scenario.py — physical distributed runner
+  benchmarks/scenarios/prod/mininet_scenario.py — mininet topology
+
+EOF
+}
+
+# ── Prod mode ─────────────────────────────────────────────────────────────────
+#
+# Each prod_run_scenario call invokes the mininet Python script with env vars.
+# Results land in prod/results/<scenario>/.
+
+PROD_RESULTS_ROOT="$SCRIPT_DIR/prod/results"
+MININET_SCRIPT="$SCRIPT_DIR/prod/mininet_scenario.py"
+
+prod_run_scenario() {
+    local name="$1"
+    local mode="${2:-pubsub}"   # pubsub | reqrep | datagram
+
+    local out_dir="$PROD_RESULTS_ROOT/$name"
+    mkdir -p "$out_dir"
+
+    printf "\n${BOLD}━━━ Prod scenario: %s ━━━${RESET}\n" "$name"
+    info "mode: $mode  duration: ${DURATION:-30}s  rate: ${MSG_RATE:-500}/s  size: ${MSG_SIZE:-256}B"
+    info "netem: delay=${NETEM_DELAY_MS:-0}ms jitter=${NETEM_JITTER_MS:-0}ms \
+loss=${NETEM_LOSS_PCT:-0}% rate=${NETEM_RATE_KBIT:-0}kbit"
+
+    export SCENARIO="$name" MODE="$mode" RESULTS_DIR="$out_dir"
+
+    local start_ts
+    start_ts=$(date +%s)
+
+    if ! sudo python3 "$MININET_SCRIPT"; then
+        warn "prod scenario '$name' exited with error"
+    fi
+
+    local wall=$(( $(date +%s) - start_ts ))
+    success "prod scenario '$name' completed in ${wall}s — results in $out_dir/"
+}
+
+# Resets network env vars for prod scenarios.
+prod_reset_net() {
+    export NETEM_DELAY_MS=0 NETEM_JITTER_MS=0 NETEM_LOSS_PCT=0
+    export NETEM_RATE_KBIT=0 NETEM_REORDER_PCT=0
+}
+
+# ── Prod scenario definitions ─────────────────────────────────────────────────
+
+prod_scenario_pubsub_baseline() {
+    prod_reset_net
+    export TOPIC=data MSG_RATE=1000 MSG_SIZE=256 DURATION=30 N_PUBS=1 N_SUBS=3
+    prod_run_scenario "prod_pubsub_baseline" "pubsub"
+}
+
+prod_scenario_pubsub_fanout() {
+    prod_reset_net
+    export TOPIC=data MSG_RATE=500 MSG_SIZE=256 DURATION=30 N_PUBS=1 N_SUBS=10
+    prod_run_scenario "prod_pubsub_fanout" "pubsub"
+}
+
+prod_scenario_pubsub_loss_5pct() {
+    prod_reset_net
+    export TOPIC=data MSG_RATE=1000 MSG_SIZE=256 DURATION=30 N_PUBS=1 N_SUBS=3
+    export NETEM_LOSS_PCT=5
+    prod_run_scenario "prod_pubsub_loss_5pct" "pubsub"
+}
+
+prod_scenario_pubsub_loss_20pct() {
+    prod_reset_net
+    export TOPIC=data MSG_RATE=1000 MSG_SIZE=256 DURATION=30 N_PUBS=1 N_SUBS=3
+    export NETEM_LOSS_PCT=20
+    prod_run_scenario "prod_pubsub_loss_20pct" "pubsub"
+}
+
+prod_scenario_pubsub_latency_50ms() {
+    prod_reset_net
+    export TOPIC=data MSG_RATE=500 MSG_SIZE=256 DURATION=30 N_PUBS=1 N_SUBS=3
+    export NETEM_DELAY_MS=50 NETEM_JITTER_MS=5
+    prod_run_scenario "prod_pubsub_latency_50ms" "pubsub"
+}
+
+prod_scenario_pubsub_latency_200ms() {
+    prod_reset_net
+    export TOPIC=data MSG_RATE=200 MSG_SIZE=256 DURATION=30 N_PUBS=1 N_SUBS=2
+    export NETEM_DELAY_MS=200 NETEM_JITTER_MS=20
+    prod_run_scenario "prod_pubsub_latency_200ms" "pubsub"
+}
+
+prod_scenario_pubsub_bandwidth_1mbit() {
+    prod_reset_net
+    export TOPIC=data MSG_RATE=2000 MSG_SIZE=512 DURATION=30 N_PUBS=1 N_SUBS=2
+    export NETEM_RATE_KBIT=1000
+    prod_run_scenario "prod_pubsub_bandwidth_1mbit" "pubsub"
+}
+
+prod_scenario_pubsub_multinode() {
+    # 10 publishers on h1, 30 subscribers on h2 — mirrors the thesis "prod" setup.
+    prod_reset_net
+    export TOPIC=data MSG_RATE=500 MSG_SIZE=256 DURATION=30 N_PUBS=10 N_SUBS=30
+    prod_run_scenario "prod_pubsub_multinode" "pubsub"
+}
+
+prod_scenario_reqrep_baseline() {
+    prod_reset_net
+    export MSG_SIZE=256 DURATION=30 N_REQS=5
+    prod_run_scenario "prod_reqrep_baseline" "reqrep"
+}
+
+prod_scenario_reqrep_stress() {
+    prod_reset_net
+    export MSG_SIZE=256 DURATION=30 N_REQS=25
+    prod_run_scenario "prod_reqrep_stress" "reqrep"
+}
+
+prod_scenario_reqrep_latency_50ms() {
+    prod_reset_net
+    export MSG_SIZE=256 DURATION=30 N_REQS=5
+    export NETEM_DELAY_MS=50 NETEM_JITTER_MS=5
+    prod_run_scenario "prod_reqrep_latency_50ms" "reqrep"
+}
+
+prod_scenario_reqrep_loss_10pct() {
+    prod_reset_net
+    export MSG_SIZE=256 DURATION=30 N_REQS=5
+    export NETEM_LOSS_PCT=10
+    prod_run_scenario "prod_reqrep_loss_10pct" "reqrep"
+}
+
+prod_scenario_datagram_baseline() {
+    prod_reset_net
+    export TOPIC=data MSG_RATE=1000 MSG_SIZE=256 DURATION=30 N_SUBS=3
+    prod_run_scenario "prod_datagram_baseline" "datagram"
+}
+
+prod_scenario_datagram_loss_5pct() {
+    prod_reset_net
+    export TOPIC=data MSG_RATE=1000 MSG_SIZE=256 DURATION=30 N_SUBS=3
+    export NETEM_LOSS_PCT=5
+    prod_run_scenario "prod_datagram_loss_5pct" "datagram"
+}
+
+prod_scenario_datagram_loss_20pct() {
+    prod_reset_net
+    export TOPIC=data MSG_RATE=1000 MSG_SIZE=256 DURATION=30 N_SUBS=3
+    export NETEM_LOSS_PCT=20
+    prod_run_scenario "prod_datagram_loss_20pct" "datagram"
+}
+
+# ┌─ TCP comparison prod scenarios ────────────────────────────────────────────┐
+# Each mirrors a QUIC scenario but sets TRANSPORT=tcp.
+# Run both sets to get head-to-head numbers for the thesis.
+
+prod_scenario_tcp_pubsub_baseline() {
+    prod_reset_net
+    export TOPIC=data MSG_RATE=1000 MSG_SIZE=256 DURATION=30 N_PUBS=1 N_SUBS=3 TRANSPORT=tcp
+    prod_run_scenario "prod_tcp_pubsub_baseline" "pubsub"
+}
+
+prod_scenario_tcp_pubsub_loss_5pct() {
+    prod_reset_net
+    export TOPIC=data MSG_RATE=1000 MSG_SIZE=256 DURATION=30 N_PUBS=1 N_SUBS=3 TRANSPORT=tcp
+    export NETEM_LOSS_PCT=5
+    prod_run_scenario "prod_tcp_pubsub_loss_5pct" "pubsub"
+}
+
+prod_scenario_tcp_pubsub_loss_20pct() {
+    prod_reset_net
+    export TOPIC=data MSG_RATE=1000 MSG_SIZE=256 DURATION=30 N_PUBS=1 N_SUBS=3 TRANSPORT=tcp
+    export NETEM_LOSS_PCT=20
+    prod_run_scenario "prod_tcp_pubsub_loss_20pct" "pubsub"
+}
+
+prod_scenario_tcp_pubsub_latency_50ms() {
+    prod_reset_net
+    export TOPIC=data MSG_RATE=500 MSG_SIZE=256 DURATION=30 N_PUBS=1 N_SUBS=3 TRANSPORT=tcp
+    export NETEM_DELAY_MS=50 NETEM_JITTER_MS=5
+    prod_run_scenario "prod_tcp_pubsub_latency_50ms" "pubsub"
+}
+
+prod_scenario_tcp_pubsub_latency_200ms() {
+    prod_reset_net
+    export TOPIC=data MSG_RATE=200 MSG_SIZE=256 DURATION=30 N_PUBS=1 N_SUBS=2 TRANSPORT=tcp
+    export NETEM_DELAY_MS=200 NETEM_JITTER_MS=20
+    prod_run_scenario "prod_tcp_pubsub_latency_200ms" "pubsub"
+}
+
+prod_scenario_tcp_reqrep_baseline() {
+    prod_reset_net
+    export MSG_SIZE=256 DURATION=30 N_REQS=5 TRANSPORT=tcp
+    prod_run_scenario "prod_tcp_reqrep_baseline" "reqrep"
+}
+
+prod_scenario_tcp_reqrep_latency_50ms() {
+    prod_reset_net
+    export MSG_SIZE=256 DURATION=30 N_REQS=5 TRANSPORT=tcp
+    export NETEM_DELAY_MS=50 NETEM_JITTER_MS=5
+    prod_run_scenario "prod_tcp_reqrep_latency_50ms" "reqrep"
+}
+
+prod_scenario_tcp_reqrep_loss_10pct() {
+    prod_reset_net
+    export MSG_SIZE=256 DURATION=30 N_REQS=5 TRANSPORT=tcp
+    export NETEM_LOSS_PCT=10
+    prod_run_scenario "prod_tcp_reqrep_loss_10pct" "reqrep"
+}
+
+ALL_PROD_SCENARIOS=(
+    # ── QUIC ──────────────────────────────────────────────────────────────────
+    prod_pubsub_baseline
+    prod_pubsub_fanout
+    prod_pubsub_loss_5pct
+    prod_pubsub_loss_20pct
+    prod_pubsub_latency_50ms
+    prod_pubsub_latency_200ms
+    prod_pubsub_bandwidth_1mbit
+    prod_pubsub_multinode
+    prod_reqrep_baseline
+    prod_reqrep_stress
+    prod_reqrep_latency_50ms
+    prod_reqrep_loss_10pct
+    prod_datagram_baseline
+    prod_datagram_loss_5pct
+    prod_datagram_loss_20pct
+    # ── TCP (comparison) ──────────────────────────────────────────────────────
+    prod_tcp_pubsub_baseline
+    prod_tcp_pubsub_loss_5pct
+    prod_tcp_pubsub_loss_20pct
+    prod_tcp_pubsub_latency_50ms
+    prod_tcp_pubsub_latency_200ms
+    prod_tcp_reqrep_baseline
+    prod_tcp_reqrep_latency_50ms
+    prod_tcp_reqrep_loss_10pct
+)
+
+# ── Phys mode (physical distributed: laptop + Raspberry Pi) ──────────────────
+#
+# Runs real binaries over the actual network between two physical machines.
+# The laptop orchestrates everything; results are recorded here.
+# Requires: REMOTE_HOST env var, SSH key auth to the Pi, Go on both machines.
+
+PHYS_RESULTS_ROOT="$SCRIPT_DIR/phys/results"
+PHYS_SCRIPT="$SCRIPT_DIR/phys/phys_scenario.py"
+
+phys_run_scenario() {
+    local name="$1"
+    local mode="${2:-pubsub}"
+
+    local out_dir="$PHYS_RESULTS_ROOT/$name"
+    mkdir -p "$out_dir"
+
+    printf "\n${BOLD}━━━ Phys scenario: %s ━━━${RESET}\n" "$name"
+    info "mode: $mode  duration: ${DURATION:-30}s  rate: ${MSG_RATE:-500}/s  size: ${MSG_SIZE:-256}B"
+    info "local:  ${LOCAL_PUBS:-2} pub(s) + ${LOCAL_SUBS:-5} sub(s)"
+    info "remote: ${REMOTE_PUBS:-2} pub(s) + ${REMOTE_SUBS:-5} sub(s)  [${REMOTE_HOST}]"
+
+    export SCENARIO="$name" MODE="$mode" RESULTS_DIR="$out_dir"
+
+    local start_ts
+    start_ts=$(date +%s)
+
+    if ! python3 "$PHYS_SCRIPT"; then
+        warn "phys scenario '$name' exited with error"
+    fi
+
+    local wall=$(( $(date +%s) - start_ts ))
+    success "phys scenario '$name' done in ${wall}s — results in $out_dir/"
+}
+
+phys_reset() {
+    export LOCAL_PUBS=2 LOCAL_SUBS=5 REMOTE_PUBS=2 REMOTE_SUBS=5
+}
+
+# ── Phys scenario definitions ──────────────────────────────────────────────────
+
+phys_scenario_pubsub_baseline() {
+    phys_reset
+    export TOPIC=data MSG_RATE=1000 MSG_SIZE=256 DURATION=30
+    phys_run_scenario "phys_pubsub_baseline" "pubsub"
+}
+
+phys_scenario_pubsub_highrate() {
+    phys_reset
+    export TOPIC=data MSG_RATE=5000 MSG_SIZE=128 DURATION=30
+    phys_run_scenario "phys_pubsub_highrate" "pubsub"
+}
+
+phys_scenario_pubsub_largemsg() {
+    phys_reset
+    export TOPIC=data MSG_RATE=200 MSG_SIZE=8192 DURATION=30
+    phys_run_scenario "phys_pubsub_largemsg" "pubsub"
+}
+
+phys_scenario_pubsub_multinode() {
+    # Full thesis scenario: 10 pubs + 30 subs on each machine.
+    export LOCAL_PUBS=10 LOCAL_SUBS=30 REMOTE_PUBS=10 REMOTE_SUBS=30
+    export TOPIC=data MSG_RATE=2000 MSG_SIZE=256 DURATION=30
+    phys_run_scenario "phys_pubsub_multinode" "pubsub"
+}
+
+phys_scenario_reqrep_baseline() {
+    phys_reset
+    export MSG_SIZE=256 DURATION=30 CONCURRENCY=5
+    phys_run_scenario "phys_reqrep_baseline" "reqrep"
+}
+
+phys_scenario_reqrep_stress() {
+    phys_reset
+    export MSG_SIZE=256 DURATION=30 CONCURRENCY=20
+    phys_run_scenario "phys_reqrep_stress" "reqrep"
+}
+
+phys_scenario_datagram_baseline() {
+    phys_reset
+    export TOPIC=data MSG_RATE=1000 MSG_SIZE=256 DURATION=30
+    phys_run_scenario "phys_datagram_baseline" "datagram"
+}
+
+phys_scenario_datagram_highrate() {
+    phys_reset
+    export TOPIC=data MSG_RATE=5000 MSG_SIZE=256 DURATION=30
+    phys_run_scenario "phys_datagram_highrate" "datagram"
+}
+
+# ┌─ TCP comparison phys scenarios ────────────────────────────────────────────┐
+
+phys_scenario_tcp_pubsub_baseline() {
+    phys_reset
+    export TOPIC=data MSG_RATE=1000 MSG_SIZE=256 DURATION=30 TRANSPORT=tcp
+    phys_run_scenario "phys_tcp_pubsub_baseline" "pubsub"
+}
+
+phys_scenario_tcp_pubsub_highrate() {
+    phys_reset
+    export TOPIC=data MSG_RATE=5000 MSG_SIZE=128 DURATION=30 TRANSPORT=tcp
+    phys_run_scenario "phys_tcp_pubsub_highrate" "pubsub"
+}
+
+phys_scenario_tcp_pubsub_largemsg() {
+    phys_reset
+    export TOPIC=data MSG_RATE=200 MSG_SIZE=8192 DURATION=30 TRANSPORT=tcp
+    phys_run_scenario "phys_tcp_pubsub_largemsg" "pubsub"
+}
+
+phys_scenario_tcp_pubsub_multinode() {
+    export LOCAL_PUBS=10 LOCAL_SUBS=30 REMOTE_PUBS=10 REMOTE_SUBS=30
+    export TOPIC=data MSG_RATE=2000 MSG_SIZE=256 DURATION=30 TRANSPORT=tcp
+    phys_run_scenario "phys_tcp_pubsub_multinode" "pubsub"
+}
+
+phys_scenario_tcp_reqrep_baseline() {
+    phys_reset
+    export MSG_SIZE=256 DURATION=30 CONCURRENCY=5 TRANSPORT=tcp
+    phys_run_scenario "phys_tcp_reqrep_baseline" "reqrep"
+}
+
+phys_scenario_tcp_reqrep_stress() {
+    phys_reset
+    export MSG_SIZE=256 DURATION=30 CONCURRENCY=20 TRANSPORT=tcp
+    phys_run_scenario "phys_tcp_reqrep_stress" "reqrep"
+}
+
+ALL_PHYS_SCENARIOS=(
+    # ── QUIC ──────────────────────────────────────────────────────────────────
+    phys_pubsub_baseline
+    phys_pubsub_highrate
+    phys_pubsub_largemsg
+    phys_pubsub_multinode
+    phys_reqrep_baseline
+    phys_reqrep_stress
+    phys_datagram_baseline
+    phys_datagram_highrate
+    # ── TCP (comparison) ──────────────────────────────────────────────────────
+    phys_tcp_pubsub_baseline
+    phys_tcp_pubsub_highrate
+    phys_tcp_pubsub_largemsg
+    phys_tcp_pubsub_multinode
+    phys_tcp_reqrep_baseline
+    phys_tcp_reqrep_stress
+)
+
+check_phys() {
+    if [[ -z "${REMOTE_HOST:-}" ]]; then
+        die "REMOTE_HOST is required for phys mode.\nSet it before calling run.sh:\n  REMOTE_HOST=192.168.1.42 REMOTE_USER=pi ./run.sh phys ..."
+    fi
+    command -v python3 >/dev/null 2>&1 || die "python3 is required for phys mode"
+    command -v ssh     >/dev/null 2>&1 || die "ssh is required for phys mode"
+    command -v scp     >/dev/null 2>&1 || die "scp is required for phys mode"
+    command -v go      >/dev/null 2>&1 || die "go is required to cross-compile for phys mode"
+    if ! ssh -o StrictHostKeyChecking=no -o BatchMode=yes \
+             "${REMOTE_USER:-pi}@${REMOTE_HOST}" true 2>/dev/null; then
+        die "Cannot SSH to ${REMOTE_USER:-pi}@${REMOTE_HOST}.\nSet up key auth first:\n  ssh-copy-id ${REMOTE_USER:-pi}@${REMOTE_HOST}"
+    fi
+    info "SSH to ${REMOTE_USER:-pi}@${REMOTE_HOST} OK"
+}
+
+phys_run_named() {
+    local name="$1"
+    local fn="phys_scenario_${name#phys_}"
+    if declare -f "$fn" > /dev/null; then
+        "$fn"
+    else
+        die "Unknown phys scenario '$name'. Run '$0 phys list' to see available."
+    fi
+}
+
+phys_list_scenarios() {
+    printf "\nAvailable phys (physical device) scenarios:\n"
+    for s in "${ALL_PHYS_SCENARIOS[@]}"; do
+        printf "  %s\n" "$s"
+    done
+    echo
+}
+
+# ── Check mininet availability ────────────────────────────────────────────────
+
+check_mininet() {
+    if ! python3 -c "import mininet" 2>/dev/null; then
+        warn "mininet Python package not found."
+        printf "Install with:\n  sudo apt-get install -y mininet\n\n"
+        read -r -p "Install now? [y/N] " ans
+        if [[ "${ans,,}" == "y" ]]; then
+            sudo apt-get install -y mininet || die "Failed to install mininet"
+        else
+            die "mininet is required for prod mode"
+        fi
+    fi
+    if [[ $EUID -ne 0 ]] && ! sudo -n true 2>/dev/null; then
+        warn "prod mode uses sudo to run mininet — you may be prompted for a password"
+    fi
+}
+
 # ── Main dispatch ─────────────────────────────────────────────────────────────
 
 build_image() {
+    require docker
+    require jq
+    docker compose version >/dev/null 2>&1 || die "docker compose v2 required (not docker-compose v1)"
     info "Building quicmq-scenarios image..."
     docker build \
         -f benchmarks/scenarios/Dockerfile \
@@ -432,8 +962,98 @@ run_named() {
     fi
 }
 
+prod_run_named() {
+    local name="$1"
+    local fn="prod_scenario_${name#prod_}"  # strip leading "prod_" if present
+    if declare -f "$fn" > /dev/null; then
+        "$fn"
+    else
+        die "Unknown prod scenario '$name'. Run '$0 prod list' to see available."
+    fi
+}
+
+prod_list_scenarios() {
+    printf "\nAvailable prod (mininet) scenarios:\n"
+    for s in "${ALL_PROD_SCENARIOS[@]}"; do
+        printf "  %s\n" "$s"
+    done
+    echo
+}
+
 main() {
-    local cmd="${1:-all}"
+    # ── Mode detection ───────────────────────────────────────────────────────
+    # First positional arg may be --help/-h or a mode (dev/prod).
+    # Anything else falls through to the dev dispatcher for backward compat.
+
+    local mode="dev"
+    local args=("$@")
+
+    if [[ ${#args[@]} -gt 0 ]]; then
+        case "${args[0]}" in
+        --help|-h)
+            print_help; exit 0 ;;
+        dev)
+            mode="dev"; args=("${args[@]:1}") ;;
+        prod)
+            mode="prod"; args=("${args[@]:1}") ;;
+        phys)
+            mode="phys"; args=("${args[@]:1}") ;;
+        esac
+    fi
+
+    if [[ "$mode" == "phys" ]]; then
+        local cmd="${args[0]:-all}"
+        case "$cmd" in
+        list)
+            phys_list_scenarios
+            return
+            ;;
+        esac
+        check_phys
+        case "$cmd" in
+        all)
+            mkdir -p "$PHYS_RESULTS_ROOT"
+            for s in "${ALL_PHYS_SCENARIOS[@]}"; do
+                phys_run_named "$s" || warn "Phys scenario '$s' failed — continuing."
+            done
+            printf "\n${BOLD}All phys scenarios complete.${RESET} Results in %s/\n\n" "$PHYS_RESULTS_ROOT"
+            ;;
+        *)
+            mkdir -p "$PHYS_RESULTS_ROOT"
+            for name in "${args[@]}"; do
+                phys_run_named "$name" || warn "Phys scenario '$name' failed — continuing."
+            done
+            ;;
+        esac
+        return
+    fi
+
+    if [[ "$mode" == "prod" ]]; then
+        check_mininet
+        local cmd="${args[0]:-all}"
+        case "$cmd" in
+        list)
+            prod_list_scenarios
+            ;;
+        all)
+            mkdir -p "$PROD_RESULTS_ROOT"
+            for s in "${ALL_PROD_SCENARIOS[@]}"; do
+                prod_run_named "$s" || warn "Prod scenario '$s' failed — continuing."
+            done
+            printf "\n${BOLD}All prod scenarios complete.${RESET} Results in %s/\n\n" "$PROD_RESULTS_ROOT"
+            ;;
+        *)
+            mkdir -p "$PROD_RESULTS_ROOT"
+            for name in "${args[@]}"; do
+                prod_run_named "$name" || warn "Prod scenario '$name' failed — continuing."
+            done
+            ;;
+        esac
+        return
+    fi
+
+    # ── Dev mode (Docker) ────────────────────────────────────────────────────
+    local cmd="${args[0]:-all}"
 
     case "$cmd" in
     build)
@@ -453,7 +1073,7 @@ main() {
     *)
         build_image
         mkdir -p "$RESULTS_ROOT"
-        for name in "$@"; do
+        for name in "${args[@]}"; do
             run_named "$name" || warn "Scenario '$name' failed — continuing."
         done
         ;;

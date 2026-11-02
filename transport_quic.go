@@ -14,8 +14,6 @@ import (
 )
 
 // Default QUIC flow-control window sizes.
-// These are generous defaults that avoid the "failed to sufficiently
-// increase receive buffer size" warning on Linux.
 const (
 	defaultInitialStreamWindow = 8 << 20  // 8 MiB
 	defaultMaxStreamWindow     = 16 << 20 // 16 MiB
@@ -32,6 +30,14 @@ const (
 	// freeze when the peer is ungracefully terminated.
 	defaultKeepAlivePeriod = 5 * time.Second
 	defaultMaxIdleTimeout  = 15 * time.Second
+
+	// defaultUDPBufferSize is the target OS-level UDP socket send/receive
+	// buffer size (7 MiB).  This matches the value recommended by quic-go
+	// (https://quic-go.net/docs/quic/optimizations/) and what quic-go itself
+	// requests internally.  The OS may grant less than this if the system
+	// limit has not been raised (Linux: net.core.rmem_max / wmem_max).
+	// Use WithUDPBufferSize to override for a specific deployment.
+	defaultUDPBufferSize = 7 << 20 // 7 MiB
 )
 
 // quicTransport implements the Transport interface using QUIC.
@@ -49,6 +55,22 @@ func init() {
 // defaultQUICConfig returns a quic.Config with increased flow-control windows,
 // short keep-alive / idle-timeout, and qlog tracing wired in.
 //
+// Optimizations applied (https://quic-go.net/docs/quic/optimizations/):
+//
+//   - GSO (Generic Segmentation Offload): enabled automatically by quic-go
+//     because we pass *net.UDPConn (implements OOBCapablePacketConn).  This
+//     batches multiple UDP packets into one kernel call on Linux 4.18+.
+//
+//   - DPLPMTUD (Path MTU Discovery, RFC 8899): enabled by leaving
+//     DisablePathMTUDiscovery at its default (false).  quic-go probes for
+//     larger packet sizes, reducing per-packet overhead on >1200-byte MTU
+//     paths.
+//
+//   - UDP buffer sizes: we explicitly call SetReadBuffer/SetWriteBuffer
+//     (defaultUDPBufferSize = 7 MiB) before passing the conn to quic.Transport.
+//     On systems where net.core.rmem_max has been raised the full 7 MiB is
+//     granted; otherwise the OS cap applies.  Use WithUDPBufferSize to tune.
+//
 // qlog output is written when the QLOGDIR environment variable is set (one
 // .sqlog file per connection).  Callers may override the Tracer field to write
 // to a custom directory via makeQlogTracer.
@@ -60,7 +82,10 @@ func defaultQUICConfig() *quic.Config {
 		MaxConnectionReceiveWindow:     defaultMaxConnWindow,
 		KeepAlivePeriod:                defaultKeepAlivePeriod,
 		MaxIdleTimeout:                 defaultMaxIdleTimeout,
-		Tracer:                         qlog.DefaultConnectionTracer,
+		// Explicitly keep DPLPMTUD enabled (the default).  quic-go sends
+		// fewer than 10 probe packets per connection to discover path MTU.
+		DisablePathMTUDiscovery: false,
+		Tracer:                  qlog.DefaultConnectionTracer,
 	}
 }
 
@@ -70,6 +95,54 @@ func defaultServerQUICConfig() *quic.Config {
 	cfg := defaultQUICConfig()
 	cfg.Allow0RTT = true
 	return cfg
+}
+
+// ctxKeyUDPBufferSize is the context key for the UDP socket buffer size.
+type ctxKeyUDPBufferSize struct{}
+
+func withUDPBufferSize(ctx context.Context, size int) context.Context {
+	return context.WithValue(ctx, ctxKeyUDPBufferSize{}, size)
+}
+
+func udpBufferSizeFromContext(ctx context.Context) int {
+	if v, ok := ctx.Value(ctxKeyUDPBufferSize{}).(int); ok && v > 0 {
+		return v
+	}
+	return defaultUDPBufferSize
+}
+
+// setUDPBuffers requests large OS-level send and receive buffers on conn.
+// quic-go also requests this internally; calling it here first ensures our
+// intent is explicit and benefits from any sysctl changes already in place
+// (Linux: net.core.rmem_max / wmem_max ≥ 7340032).
+// Errors are intentionally ignored: if the OS grants less than requested,
+// quic-go will log a warning with instructions to increase the system limit.
+func setUDPBuffers(conn *net.UDPConn, size int) {
+	_ = conn.SetReadBuffer(size)
+	_ = conn.SetWriteBuffer(size)
+}
+
+// ctxKeyStatelessReset is the context key for the QUIC stateless reset key.
+type ctxKeyStatelessReset struct{}
+
+// withStatelessResetKey stores a stateless reset key in ctx.
+// Both Dial and Listen read it from ctx and apply it to their quic.Transport,
+// enabling stateless reset (RFC 9000 §10.3): when a peer receives a packet for
+// an unknown connection (e.g. after a crash), it sends a reset token derived
+// from this key + the connection ID, letting the remote side detect the dead
+// connection within ~1 RTT instead of waiting for the idle timeout.
+func withStatelessResetKey(ctx context.Context, key [32]byte) context.Context {
+	k := quic.StatelessResetKey(key)
+	return context.WithValue(ctx, ctxKeyStatelessReset{}, k)
+}
+
+// statelessResetKeyFromContext extracts the stateless reset key, or nil.
+func statelessResetKeyFromContext(ctx context.Context) *quic.StatelessResetKey {
+	v, ok := ctx.Value(ctxKeyStatelessReset{}).(quic.StatelessResetKey)
+	if !ok {
+		return nil
+	}
+	return &v
 }
 
 // Dial creates a new QUIC connection to addr, opens a bidirectional stream,
@@ -90,31 +163,34 @@ func (t *quicTransport) Dial(ctx context.Context, addr string) (net.Conn, error)
 	if err != nil {
 		return nil, fmt.Errorf("quicmq: listen udp: %w", err)
 	}
+	setUDPBuffers(udpConn, udpBufferSizeFromContext(ctx))
 
-	tr := &quic.Transport{Conn: udpConn}
+	tr := &quic.Transport{
+		Conn:              udpConn,
+		StatelessResetKey: statelessResetKeyFromContext(ctx),
+	}
 	qcfg := defaultQUICConfig()
 	if dir := qlogDirFromContext(ctx); dir != "" {
 		qcfg.Tracer = makeQlogTracer(dir)
 	}
 
-	// DialEarly sends the ClientHello together with 0-RTT early data when a
-	// cached TLS session is available (tls.Config.ClientSessionCache).  On a
-	// cold start it behaves identically to Dial — the connection completes the
-	// full 1-RTT handshake and the server issues a session ticket for future
-	// reconnects.
+	// DialEarly starts the TLS 1.3 handshake and enables 0-RTT session resumption
+	// when a cached session ticket is available.  On a cold start it behaves
+	// identically to Dial.
 	qconn, err := tr.DialEarly(ctx, udpAddr, tlsCfg, qcfg)
 	if err != nil {
 		udpConn.Close()
 		return nil, fmt.Errorf("quicmq: dial %q: %w", addr, err)
 	}
 
-	// Wait for the handshake to complete before touching the stream map.
-	// quic-go v0.56 has an internal race between HandleTransportParameters
-	// (which finalises stream limits) and OpenStreamSync (which reads them via
-	// initMaps) when a stream is opened before HandshakeComplete fires.
-	// Waiting here is safe: TLS session tickets are still cached from the
-	// DialEarly call, so 0-RTT session resumption continues to work on the
-	// next reconnect even though we no longer open the stream as early data.
+	// Wait for the TLS handshake to complete before opening a stream.
+	// Opening a stream on the EarlyConnection before this point would race
+	// with quic-go's handleHandshakeComplete (which applies transport
+	// parameters used by the stream's flow controller), and would produce
+	// a 0-RTT-rejected stream when the server rejects early data (e.g. a
+	// stale session ticket from a different server).  We still get the
+	// 0-RTT latency benefit for the handshake itself; we just don't send
+	// the ZMTP greeting as early data, which requires a server response anyway.
 	select {
 	case <-qconn.HandshakeComplete():
 	case <-ctx.Done():
@@ -123,22 +199,16 @@ func (t *quicTransport) Dial(ctx context.Context, addr string) (net.Conn, error)
 		return nil, fmt.Errorf("quicmq: handshake for %q: %w", addr, ctx.Err())
 	}
 
-	// After HandshakeComplete, the DialEarly *quic.Conn may still be in a
-	// "0-RTT rejected" state if the server discarded our early data (e.g.
-	// because its ticket key rotated after a restart).  In that case
-	// OpenStreamSync returns Err0RTTRejected and we must obtain the fresh
-	// 1-RTT connection via NextConnection before retrying.
-	stream, err := qconn.OpenStreamSync(ctx)
-	if isErr0RTTRejected(err) {
-		nextConn, nextErr := qconn.NextConnection(ctx)
-		if nextErr != nil {
-			qconn.CloseWithError(0, "0-RTT rejected, 1-RTT fallback failed")
-			udpConn.Close()
-			return nil, fmt.Errorf("quicmq: 0-RTT fallback for %q: %w", addr, nextErr)
-		}
-		qconn = nextConn
-		stream, err = qconn.OpenStreamSync(ctx)
+	// NextConnection finalises the post-handshake state (calls UseResetMaps
+	// internally).  Since we already waited on HandshakeComplete above, this
+	// returns immediately and is safe to call on every code path.
+	if _, err = qconn.NextConnection(ctx); err != nil {
+		qconn.CloseWithError(0, "post-handshake NextConnection failed")
+		udpConn.Close()
+		return nil, fmt.Errorf("quicmq: post-handshake for %q: %w", addr, err)
 	}
+
+	stream, err := qconn.OpenStreamSync(ctx)
 	if err != nil {
 		qconn.CloseWithError(0, "stream open failed")
 		udpConn.Close()
@@ -171,8 +241,12 @@ func (t *quicTransport) Listen(ctx context.Context, addr string) (net.Listener, 
 	if err != nil {
 		return nil, fmt.Errorf("quicmq: listen udp on %q: %w", addr, err)
 	}
+	setUDPBuffers(udpConn, udpBufferSizeFromContext(ctx))
 
-	tr := &quic.Transport{Conn: udpConn}
+	tr := &quic.Transport{
+		Conn:              udpConn,
+		StatelessResetKey: statelessResetKeyFromContext(ctx),
+	}
 	qcfg := defaultServerQUICConfig() // includes Allow0RTT
 	if dir := qlogDirFromContext(ctx); dir != "" {
 		qcfg.Tracer = makeQlogTracer(dir)
@@ -230,8 +304,13 @@ func (sc *streamConn) Close() error {
 	return sc.stream.Close()
 }
 
-// Verify net.Conn implementation at compile time.
-var _ net.Conn = (*streamConn)(nil)
+// isZMTPConn implements zmtpMarker so Open() performs the ZMTP 3.1 handshake
+// and uses ZMTP framing on QUIC streams, matching the TCP transport exactly.
+func (*streamConn) isZMTPConn() {}
+
+// Verify net.Conn and zmtpMarker implementations at compile time.
+var _ net.Conn    = (*streamConn)(nil)
+var _ zmtpMarker  = (*streamConn)(nil)
 
 // --- quicListener: net.Listener over QUIC ---
 

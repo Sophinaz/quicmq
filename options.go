@@ -140,6 +140,75 @@ func WithQlogDir(dir string) Option {
 	}
 }
 
+// WithCurveServer enables ZMTP CURVE encryption for TCP Listen calls.
+// The socket will use key as its permanent keypair during the CURVE handshake.
+// Clients must be configured with WithCurveClient and key.Public as the server
+// public key.  Has no effect on QUIC connections (which use TLS 1.3 natively).
+func WithCurveServer(key CurveKey) Option {
+	return func(s *socket) {
+		s.curveServerKey = &key
+	}
+}
+
+// WithCurveClient enables ZMTP CURVE encryption for TCP Dial calls.
+// clientKey is the client's permanent keypair; serverPublicKey is the server's
+// permanent public key (obtained out-of-band, e.g. embedded in config).
+// Has no effect on QUIC connections.
+func WithCurveClient(clientKey CurveKey, serverPublicKey [32]byte) Option {
+	return func(s *socket) {
+		s.curveClientKey = &clientKey
+		s.curveServerPublicKey = &serverPublicKey
+	}
+}
+
+// WithCurveTimingDir enables per-handshake CURVE timing instrumentation.
+// When set, each CURVE handshake writes a JSON timing file into dir recording
+// elapsed milliseconds at each step (HELLO, WELCOME, INITIATE, READY).
+// These files are analogous to QUIC qlog .sqlog files and can be processed
+// by the handshake-analyze tool for a side-by-side post-handshake comparison.
+// Has no effect on QUIC connections (use WithQlogDir for those).
+func WithCurveTimingDir(dir string) Option {
+	return func(s *socket) {
+		s.curveTimingDir = dir
+	}
+}
+
+// WithUDPBufferSize sets the target OS-level send and receive buffer size for
+// the UDP socket underlying each QUIC connection created by this socket.
+//
+// The default is 7 MiB, matching the quic-go recommendation
+// (https://quic-go.net/docs/quic/optimizations/).  The OS may grant less than
+// the requested size unless the system limit has been raised:
+//
+//	# Linux — raise the kernel maximum (persists only until reboot):
+//	sysctl -w net.core.rmem_max=7340032
+//	sysctl -w net.core.wmem_max=7340032
+//
+// This does not affect QUIC flow-control windows (see the default 8–32 MiB
+// values in transport_quic.go); it affects only the kernel UDP ring buffer
+// that sits below QUIC.  Larger buffers reduce packet loss under bursty load.
+func WithUDPBufferSize(size int) Option {
+	return func(s *socket) {
+		s.udpBufferSize = size
+	}
+}
+
+// WithStatelessResetKey sets a persistent QUIC stateless reset key (RFC 9000 §10.3).
+//
+// By default quicmq generates a random key per socket at startup, which enables
+// stateless reset within a single process lifetime. Set a stable, secret [32]byte
+// key that you persist across restarts to also enable cross-restart fast detection:
+// after a server crash and reboot with the same key, peers will receive a stateless
+// reset token and detect the dead connection within ~1 RTT rather than waiting for
+// the idle timeout.
+//
+// The key must be kept secret; treat it like a symmetric cryptographic secret.
+func WithStatelessResetKey(key [32]byte) Option {
+	return func(s *socket) {
+		s.statelessResetKey = key
+	}
+}
+
 // Option name constants for SetOption / GetOption.
 const (
 	OptionSubscribe   = "SUBSCRIBE"
